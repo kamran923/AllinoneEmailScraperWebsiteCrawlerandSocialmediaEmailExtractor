@@ -1,0 +1,714 @@
+import time
+import re
+import os
+import datetime
+import threading
+import urllib.parse
+import pickle
+import random
+from queue import Queue
+from urllib.parse import urlparse
+import requests
+from io import BytesIO
+import openpyxl
+import pytesseract
+from PIL import Image
+
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from threading import Lock
+
+EMAIL_REGEX = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+FILTER_STRINGS = [
+    "@3x.dd058ad.webp", "@sentry.wixpress.com", "@sentry.io", "@webador.com", "@o160250.ingest.sentry.io", "@company.com", "@domain.com", "@yourname.com", "@1.2x.jpg", "@o13855.ingest.us.sentry.io", "@o293668.ingest.us.sentry.io",
+    "@desktop.18a548be03ca5139fa98.js", "@o28395.ingest.sentry.io", "@desktop.c60898a3abec08181f9a.js", "@0.5x.png", "@2x-100.jpg", "@4x-100.jpg", "@1x.jpg", "@1.2x.png",
+    "@1x.png", "@desktop.d2cdecded3ad5a997886.js", "@2x.b25d43a.webp", "@desktop.ts", "@latinotype.com", "@example.org", "@2x.gif", "@o485653.ingest.sentry.io",
+    "@desktop.b7c17169f2b819cf186b.js", "@desktop.ts", "@desktop.455cae0c.svg", "@jovanny.ru",
+    "@2x.ccef81f.png", "@desktop.57e6d187c0c45cb2bfcd.js", "@2x.png", "@desktop.37f2fc45a74ce13cd6f1.js", "@issacertifiedtrainer.com", "@issaonline.com",
+    "@desktop.f3754970727b2c51a432.js", "@3x.450dd0d.png", "@desktop.ecda7267.svg", "@300x.png", "@glossgenius.com",
+    "@desktop.21e618fde27364c6e418.js", "@desktop.21e618fde27364c6e418.js", "@o245176.ingest.sentry.io", "@o485653.ingest.sentry.io",
+    "@desktop.b346bfd4d9137b1559e5.js", "@desktop.e5ea6dcab64ed85fddb7.js", "@EMAILADDRESS.COM", "@2x-scaled.png", "@website.com", "@domain.ext",
+    "@desktop.17d24ab5217411b6d4a7.js", "@desktop.bc430315f652ccd940a4.js", "@4x.png", "@2x2.jpg", "@4x.png", "@2x2.jpg","@o17585.ingest.us.sentry.io",
+    "@desktop.8fc43891297a2529bf20.js", "@desktop.ee25e300e28475a42a17.js", "@o37417.ingest.sentry.io", "@o61919.ingest.us.sentry.io",
+    "@desktop.ee25e300e28475a42a17.js", "@example.com", "@mail.instagram.com", "@o4505290921410560.ingest.sentry.io",
+    "@desktop.d4936f3e04c29bbdb2ae.js", "@desktop.4fa73f92aff03e69de50.js", "@atom.com", "@o162821.ingest.sentry.io", "@o485653.ingest.sentry.io",
+    "@3x.450dd0d.png, serp-meta__icon_type_map@desktop.ecda7267.svg", "@desktop.f5b248d05ae68fb1e8b6.js",
+    "@desktop.f08a26aa4a64f723aaaa.js", "@desktop.40ab0b5c5343c17a6e10.js", "@desktop.4d199146ebb7f7a6cd23.js", "@o1412351.ingest.sentry.io",
+    "@desktop.4b09a8fc9d822d1e5909.js", "@desktop.209e69eb51db4d704027.js", "@desktop.87802e134d0e7db05692.js",
+    "@desktop.7a66319fb4ecfac75ebf.js", "@desktop.56f574caf8ac5dcb47cf.js", "@desktop.89090d30c1cb77975ecd.js", "@sentry.dhgate.com",
+    "@desktop.2d0e761c341592ff72c9.js", "@desktop.7bc5793eb31ac463ed34.js", "@desktop.2d0e761c341592ff72c9.js", "@o477720.ingest.sentry.io",
+    "@sentry-next.wixpress.com", "@2x-202403150757.png", "@o28395.ingest.us.sentry.io", "@mystore.com", "@-Reps.jpg", "@2x.webp",
+    "@latofonts.com", "@godaddy.com", "@astigmatic.com", "@o61919.ingest.sentry.io", "@aldusleaf.org", "@sentry.gumtree.cloud", "@o282387.ingest.us.sentry.io", "@sentry.utils.inputhealth.com",
+    "@schedulista.com", "@eyebytes.com", "@afternic.com", "@micahrich.com", "@rfuenzalida.com", "@2x.jpg", "@3x.png", "@group.calendar.google.com",
+    "@ndiscovered.com", "@pixelspread.com", "@indiantypefoundry.com", "@2x.jpeg", "@o4506225101766656.ingest.sentry.io","@o46801.ingest.us.sentry.io"
+]
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".js", ".png.avif", ".jpg.avif", ".avif", "2x.avif")
+
+driver_setup_lock = Lock()
+
+
+def filter_emails(email_list, filter_list=FILTER_STRINGS):
+    filtered = []
+    for email in email_list:
+        email_lower = email.lower()
+        if any(sub in email for sub in filter_list):
+            continue
+        if email_lower.endswith(IMAGE_EXTENSIONS):
+            continue
+        filtered.append(email)
+    return filtered
+
+
+def extract_text_from_image(image):
+    return pytesseract.image_to_string(image)
+
+
+def scrape_emails_from_page_source(page_source):
+    emails = re.findall(EMAIL_REGEX, page_source, re.IGNORECASE)
+    try:
+        decoded_source = urllib.parse.unquote(page_source)
+        decoded_emails = re.findall(EMAIL_REGEX, decoded_source, re.IGNORECASE)
+        emails.extend(decoded_emails)
+    except Exception:
+        pass
+    return list(set(emails))
+
+
+def scroll_down_page(driver):
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    while True:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(random.uniform(2.0, 3.5))  # Thora lamba wait scrolling ke darmiyan
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+
+
+def extract_emails_from_image(image_url):
+    try:
+        response = requests.get(image_url)
+        img = Image.open(BytesIO(response.content))
+        text = extract_text_from_image(img)
+        return re.findall(EMAIL_REGEX, text, re.IGNORECASE)
+    except Exception as e:
+        return []
+
+
+def is_internal_link(link, base_domain):
+    parsed_link = urlparse(link)
+    return parsed_link.netloc == base_domain
+
+
+def extract_links_with_selenium(driver, base_url):
+    try:
+        driver.get(base_url)
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_all_elements_located((By.TAG_NAME, "a"))
+        )
+        elements = driver.find_elements(By.TAG_NAME, "a")
+        base_domain = urlparse(base_url).netloc
+        internal_links = []
+        facebook_links = []
+        instagram_links = []
+        youtube_links = []
+        linktree_links = []
+        for element in elements:
+            href = element.get_attribute('href')
+            if not href:
+                continue
+
+            href_lower = href.lower()
+
+            if href_lower.startswith(('mailto:', 'tel:', 'javascript:')):
+                continue
+
+            if 'facebook.com' in href_lower:
+                facebook_links.append(href)
+            elif 'instagram.com' in href_lower:
+                instagram_links.append(href)
+            elif 'youtube.com' in href_lower or 'youtu.be' in href_lower:
+                youtube_links.append(href)
+            elif 'linktr.ee' in href_lower:
+                linktree_links.append(href)
+            elif is_internal_link(href, base_domain):
+                internal_links.append(href)
+        return internal_links, facebook_links, instagram_links, youtube_links, linktree_links
+    except Exception as e:
+        return [], [], [], [], []
+
+
+def extract_emails_with_waits_and_decoding(driver):
+    emails = set()
+    try:
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+    except:
+        pass
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+    time.sleep(random.uniform(2.5, 4.0))
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(random.uniform(2.5, 3.5))
+    page_source = driver.page_source
+    emails.update(scrape_emails_from_page_source(page_source))
+    try:
+        elements = driver.find_elements(By.XPATH, "//*[@href]")
+        for el in elements:
+            href = el.get_attribute("href")
+            if href:
+                decoded_href = urllib.parse.unquote(href)
+                found = re.findall(EMAIL_REGEX, decoded_href, re.IGNORECASE)
+                emails.update(found)
+    except Exception:
+        pass
+    return list(emails)
+
+
+def extract_linktree_specific_emails(driver):
+    emails = set()
+    try:
+        elements = driver.find_elements(By.XPATH, "//a[starts-with(@href, 'mailto:')]")
+        for el in elements:
+            href = el.get_attribute("href")
+            if href:
+                email = href.replace("mailto:", "").split("?")[0].strip()
+                if re.match(EMAIL_REGEX, email, re.IGNORECASE):
+                    emails.add(email)
+    except Exception:
+        pass
+    try:
+        elements = driver.find_elements(By.XPATH, "//p | //span | //h1 | //h2 | //a")
+        for el in elements:
+            text = el.text
+            if text and "@" in text:
+                found = re.findall(EMAIL_REGEX, text, re.IGNORECASE)
+                emails.update(found)
+    except Exception:
+        pass
+    try:
+        scripts = driver.find_elements(By.TAG_NAME, "script")
+        for script in scripts:
+            script_content = script.get_attribute("innerHTML")
+            if script_content and "@" in script_content:
+                decoded_script = urllib.parse.unquote(script_content)
+                found = re.findall(EMAIL_REGEX, decoded_script, re.IGNORECASE)
+                emails.update(found)
+    except Exception:
+        pass
+    return list(emails)
+
+
+def get_emails_without_login(url):
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        return scrape_emails_from_page_source(response.text)
+    except Exception:
+        return []
+
+
+def process_website(driver, url):
+    print(f"\nProcessing links for {url}")
+    internal_links, facebook_links, instagram_links, youtube_links, linktree_links = extract_links_with_selenium(driver,
+                                                                                                                 url)
+
+    internal_links_visited = 0
+    facebook_links_visited = 0
+    instagram_links_visited = 0
+    youtube_links_visited = 0
+    linktree_links_visited = 0
+
+    MAX_INTERNAL_LINKS = 30
+    MAX_FACEBOOK_LINKS = 10
+    MAX_INSTAGRAM_LINKS = 10
+    MAX_YOUTUBE_LINKS = 5
+    MAX_LINKTREE_LINKS = 10
+
+    internal_emails = set()
+    facebook_emails = set()
+    instagram_emails = set()
+    youtube_emails = set()
+    linktree_emails = set()
+    actions = ActionChains(driver)
+
+    for link in internal_links:
+        if internal_links_visited >= MAX_INTERNAL_LINKS:
+            break
+        try:
+            driver.get(link)
+            internal_emails.update(extract_emails_with_waits_and_decoding(driver))
+            internal_links_visited += 1
+        except Exception:
+            pass
+
+    for link in facebook_links:
+        if facebook_links_visited >= MAX_FACEBOOK_LINKS:
+            break
+        try:
+            facebook_emails.update(get_emails_without_login(link))
+            driver.get(link)
+            facebook_emails.update(extract_emails_with_waits_and_decoding(driver))
+            facebook_links_visited += 1
+        except Exception:
+            pass
+
+    for link in instagram_links:
+        if instagram_links_visited >= MAX_INSTAGRAM_LINKS:
+            break
+        try:
+            instagram_emails.update(get_emails_without_login(link))
+            driver.get(link)
+            time.sleep(random.uniform(4.0, 6.0))
+            instagram_emails.update(extract_emails_with_waits_and_decoding(driver))
+
+            try:
+                print(f"Looking for recent posts on Instagram: {link}")
+                post_elements = driver.find_elements(By.XPATH,
+                                                     "//a[contains(@href, '/p/') or contains(@href, '/reel/')]")
+                post_urls = []
+                for el in post_elements:
+                    href = el.get_attribute('href')
+                    if href and href not in post_urls:
+                        post_urls.append(href)
+                    if len(post_urls) >= 4:
+                        break
+
+                for i, post_url in enumerate(post_urls, 1):
+                    print(f"  -> Opening Instagram Post {i}/4: {post_url}")
+                    driver.get(post_url)
+                    time.sleep(random.uniform(3.0, 5.0))
+                    instagram_emails.update(extract_emails_with_waits_and_decoding(driver))
+            except Exception:
+                pass
+
+            instagram_links_visited += 1
+        except Exception:
+            pass
+
+    # ========================================================
+    # --- YOUTUBE PROCESSING (ULTRA HUMANIZED + AUTO-SKIP) ---
+    # ========================================================
+    for link in youtube_links:
+        if youtube_links_visited >= MAX_YOUTUBE_LINKS:
+            break
+        try:
+            driver.get(link)
+            # Longer wait to let all background Google scripts load fully
+            time.sleep(random.uniform(6.0, 9.0))
+
+            try:
+                for _ in range(3):
+                    driver.execute_script(f"window.scrollBy(0, {random.randint(200, 350)});")
+                    time.sleep(random.uniform(1.0, 2.0))
+                time.sleep(random.uniform(1.5, 2.5))
+                driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(random.uniform(2.0, 3.5))
+            except Exception:
+                pass
+
+            try:
+                more_btn = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH,
+                                                    "//*[@id='page-header']//span[contains(text(), '...more')] | //meta[@itemprop='description']/parent::*//span[contains(text(), '...more')] | //*[@id='description-container']//span[contains(text(), '...more')]"))
+                )
+                actions.move_to_element(more_btn).pause(random.uniform(1.0, 2.0)).click().perform()
+                time.sleep(random.uniform(3.0, 4.5))
+            except Exception:
+                print("Could not find '...more' button or popup already open.")
+
+            try:
+                view_email_btn = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH,
+                                                    "//*[contains(text(), 'View email address') or contains(@aria-label, 'View email')]"))
+                )
+                actions.move_to_element(view_email_btn).pause(random.uniform(1.5, 3.0)).click().perform()
+                print(f"Clicked 'View email address' on YouTube: {link}")
+
+                # Extra wait before dealing with captcha to let Google's risk analysis finish
+                time.sleep(random.uniform(4.0, 6.0))
+
+                try:
+                    captcha_iframe = WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located(
+                            (By.XPATH, "//iframe[contains(@src, 'recaptcha') or contains(@title, 'reCAPTCHA')]"))
+                    )
+                    driver.switch_to.frame(captcha_iframe)
+
+                    checkbox = WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.ID, "recaptcha-anchor"))
+                    )
+
+                    # Simulated "shaky" mouse movement to the checkbox
+                    actions.move_to_element_with_offset(checkbox, random.randint(-10, 10), random.randint(-5, 5)).pause(
+                        random.uniform(1.0, 2.0))
+                    actions.move_to_element(checkbox).pause(random.uniform(1.5, 2.5)).click().perform()
+                    print("Clicked reCAPTCHA checkbox. Waiting for validation...")
+
+                    is_auto_verified = False
+
+                    # 10 seconds tak green tick ka wait karna
+                    for _ in range(10):
+                        if checkbox.get_attribute("aria-checked") == "true":
+                            is_auto_verified = True
+                            break
+                        time.sleep(1)
+
+                    driver.switch_to.default_content()
+
+                    if is_auto_verified:
+                        print("✅ Captcha Auto-Verified! Submitting...")
+                        time.sleep(random.uniform(2.0, 3.5))
+                        try:
+                            submit_btn = WebDriverWait(driver, 10).until(
+                                EC.presence_of_element_located((By.XPATH,
+                                                                "//button[contains(@aria-label, 'Submit') or .//span[text()='Submit']] | //*[@id='submit-btn']"))
+                            )
+                            actions.move_to_element(submit_btn).pause(random.uniform(1.0, 2.0)).click().perform()
+                            print("Clicked Submit. Waiting for email to decrypt...")
+                            time.sleep(random.uniform(5.0, 7.0))
+                        except Exception:
+                            print("Submit button not found.")
+                    else:
+                        print("❌ Puzzle Captcha detected! Skipping this channel to save time...")
+                        youtube_links_visited += 1
+                        continue  # Skip to the next YouTube channel
+
+                except Exception as e:
+                    driver.switch_to.default_content()
+                    print("Captcha iframe not found or bypassed natively.")
+
+            except Exception:
+                pass
+
+            youtube_emails.update(extract_emails_with_waits_and_decoding(driver))
+            youtube_links_visited += 1
+        except Exception:
+            pass
+    # ========================================================
+
+    for link in linktree_links:
+        if linktree_links_visited >= MAX_LINKTREE_LINKS:
+            break
+        try:
+            driver.get(link)
+            linktree_emails.update(extract_emails_with_waits_and_decoding(driver))
+            linktree_emails.update(extract_linktree_specific_emails(driver))
+            linktree_links_visited += 1
+            print(f"Processed Linktree link: {link} - Found emails: {linktree_emails}")
+        except Exception as e:
+            print(f"Error processing Linktree: {link} - Error: {e}")
+
+    return list(internal_emails), list(facebook_emails), list(instagram_emails), list(youtube_emails), list(
+        linktree_emails)
+
+
+def setup_driver():
+    options = uc.ChromeOptions()
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-save-password-bubble")
+
+    prefs = {
+        "download.prompt_for_download": False,
+        "download.default_directory": os.devnull,
+        "download_restrictions": 3,
+        "profile.default_content_setting_values.automatic_downloads": 2,
+        "profile.default_content_setting_values.popups": 2,
+        "profile.default_content_setting_values.handlers": 2
+    }
+    options.add_experimental_option("prefs", prefs)
+
+    with driver_setup_lock:
+        # REMOVED: version_main=146 to allow auto-detection of your current Chrome version
+        driver = uc.Chrome(options=options)
+    return driver
+
+
+def manual_social_login(platform_name, login_url, check_url, cookie_file):
+    driver = setup_driver()
+
+    if os.path.exists(cookie_file):
+        print(f"\n[*] Checking {platform_name} session validity...")
+        driver.get(check_url + "robots.txt")
+        with open(cookie_file, "rb") as f:
+            for cookie in pickle.load(f):
+                try:
+                    driver.add_cookie(cookie)
+                except:
+                    pass
+
+        driver.get(check_url)
+        time.sleep(random.uniform(4.0, 6.0))
+
+        is_logged_in = False
+        if platform_name == "Facebook":
+            if not driver.find_elements(By.ID, "email"):
+                is_logged_in = True
+        elif platform_name == "Instagram":
+            if "login" not in driver.current_url and not driver.find_elements(By.NAME, "username"):
+                is_logged_in = True
+        elif platform_name == "YouTube":
+            if not driver.find_elements(By.XPATH, "//a[contains(@href, 'ServiceLogin')]"):
+                is_logged_in = True
+
+        if is_logged_in:
+            print(f"[+] {platform_name} session is VALID! Skipping login.")
+            driver.quit()
+            return
+        else:
+            print(f"[-] {platform_name} session EXPIRED. Deleting old session...")
+            os.remove(cookie_file)
+    else:
+        print(f"\n--- {platform_name} Login Required ---")
+
+    print(f"Opening browser for manual {platform_name} login...")
+    driver.get(login_url)
+
+    print("\n*******************************************************")
+    print(f"1. Please log into {platform_name} in the newly opened window.")
+    print("2. Complete any confirmation or 2FA if prompted.")
+    print("3. Once you are fully logged in and see your feed/home page...")
+    print("*******************************************************\n")
+
+    input(f">>> PRESS ENTER HERE ONCE YOU ARE LOGGED IN TO {platform_name.upper()} <<<")
+
+    cookies = driver.get_cookies()
+    with open(cookie_file, "wb") as f:
+        pickle.dump(cookies, f)
+
+    print(f"[+] {platform_name} session saved successfully! Subsequent runs will use this session.")
+    driver.quit()
+
+
+website_email_dict = {}
+dict_lock = Lock()
+processed_count = 0
+total_urls = 0
+
+
+def process_url_queue(url_queue, thread_id):
+    global processed_count, total_urls
+    driver = setup_driver()
+
+    try:
+        if os.path.exists("fb_cookies.pkl"):
+            driver.get("https://www.facebook.com/robots.txt")
+            with open("fb_cookies.pkl", "rb") as f:
+                for cookie in pickle.load(f):
+                    try:
+                        driver.add_cookie(cookie)
+                    except:
+                        pass
+
+        if os.path.exists("ig_cookies.pkl"):
+            driver.get("https://www.instagram.com/robots.txt")
+            with open("ig_cookies.pkl", "rb") as f:
+                for cookie in pickle.load(f):
+                    try:
+                        driver.add_cookie(cookie)
+                    except:
+                        pass
+
+        if os.path.exists("yt_cookies.pkl"):
+            driver.get("https://www.youtube.com/robots.txt")
+            with open("yt_cookies.pkl", "rb") as f:
+                for cookie in pickle.load(f):
+                    try:
+                        driver.add_cookie(cookie)
+                    except:
+                        pass
+    except Exception as e:
+        print(f"Thread {thread_id}: Failed to load cookies: {e}")
+
+    while not url_queue.empty():
+        url = url_queue.get()
+        try:
+            print(f"\nThread {thread_id}: Processing URL: {url}")
+
+            with dict_lock:
+                website_email_dict[url] = {
+                    "direct": [],
+                    "selenium_internal": [],
+                    "search_engine": [],
+                    "facebook": [],
+                    "instagram": [],
+                    "youtube": [],
+                    "linktree": []
+                }
+            driver.get(url)
+            time.sleep(random.uniform(3.0, 4.5))
+            page_source = driver.page_source
+            direct_emails_visible = scrape_emails_from_page_source(page_source)
+            scroll_down_page(driver)
+            page_source = driver.page_source
+            direct_emails_hidden = scrape_emails_from_page_source(page_source)
+            direct_emails = list(set(direct_emails_visible + direct_emails_hidden))
+            with dict_lock:
+                website_email_dict[url]["direct"].extend(direct_emails)
+
+            selenium_internal_emails, facebook_emails, instagram_emails, youtube_emails, linktree_emails = process_website(
+                driver, url)
+
+            with dict_lock:
+                website_email_dict[url]["selenium_internal"].extend(selenium_internal_emails)
+                website_email_dict[url]["facebook"].extend(facebook_emails)
+                website_email_dict[url]["instagram"].extend(instagram_emails)
+                website_email_dict[url]["youtube"].extend(youtube_emails)
+                website_email_dict[url]["linktree"].extend(linktree_emails)
+                query = f"{url} email".replace(' ', '+')
+                search_engines = {
+                    "Yahoo": "https://search.yahoo.com/search?p=",
+                    "Bing": "https://www.bing.com/search?q=",
+                    "DuckDuckGo": "https://duckduckgo.com/?q=",
+                    "AOL": "https://search.aol.com/aol/search?q=",
+                    "Ecosia": "https://www.ecosia.org/search?q=",
+                    "Excite": "https://results.excite.com/serp?q=",
+                }
+            for engine_name, engine_url in search_engines.items():
+                driver.get(f"{engine_url}{query}")
+                time.sleep(random.uniform(2.0, 3.5))
+                search_engine_emails = scrape_emails_from_page_source(driver.page_source)
+                with dict_lock:
+                    website_email_dict[url]["search_engine"].extend(search_engine_emails)
+        except Exception as e:
+            print(f"Thread {thread_id}: Error with {url}: {e}")
+        finally:
+            with dict_lock:
+                processed_count += 1
+                pending_count = total_urls - processed_count
+                print(f"\n--- [UPDATE] Processed: {processed_count}/{total_urls} | Pending: {pending_count} ---")
+            url_queue.task_done()
+    driver.quit()
+
+
+urls_string = """
+https://www.zumbawithfrannie.com
+http://alpinefitnesscenter.com
+https://nextleveltrainingcentermma.com
+"""
+urls = [url.strip() for url in urls_string.strip().split('\n') if url.strip()]
+total_urls = len(urls)
+url_queue = Queue()
+for url in urls:
+    url_queue.put(url)
+
+manual_social_login("Facebook", "https://www.facebook.com/login", "https://www.facebook.com/", "fb_cookies.pkl")
+manual_social_login("Instagram", "https://www.instagram.com/accounts/login/", "https://www.instagram.com/",
+                    "ig_cookies.pkl")
+manual_social_login("YouTube", "https://accounts.google.com/ServiceLogin?service=youtube", "https://www.youtube.com/",
+                    "yt_cookies.pkl")
+
+print(f"Starting execution for {total_urls} websites...")
+start_time = time.time()
+num_threads = 9
+threads = []
+for i in range(num_threads):
+    thread = threading.Thread(target=process_url_queue, args=(url_queue, i + 1))
+    thread.start()
+    threads.append(thread)
+for thread in threads:
+    thread.join()
+
+remove_emails = [
+    "typesetit@att.net", "abuse@bodis.com", "example@mysite.com", "hello@businessname.com", "sales@youcanbook.me", "yourdomain@mail.com", "username@gmail.com", "myemail@mailservice.com",
+    "wweeiihhuuaanngg@gmail.com", "impallari@gmail.com", "aliappdev@service.alibaba.com", "email@yourmail.com", "info@email.com","youremail@emails.com","yourname@example.org",
+    "user@domain.com", "jane.smith@gmail.com", "hello@yourdomain.com", "info@latinotype.com", "example@mail.com", "info@ouraddress.com", "yourname@gmail.com", "info@yourdomain.com"
+    "noreply@blogger.com", "example@gmail.com", "example@gmail.com", "yourname@yourdomain.com", "email@address.com", "you@gmail.com", "yourname@email.com", "your.email@address.com", "me@gmail.com",
+    "c_e59010e3a02ffecc72c5aa961e3371a253c68c4d440e2ea29f9d85de8e43ef89@group.calendar.google.com",
+    "chenowith52@gmail.com", "test@gmail.com", "support@zumba.com", "test@test.com", "example@email.com", "info@mydomain.com", "mymail@mailservice.com", "youremail@yourdomain.com",
+    "test@mail.com", "jonpinhorn.typedesign@gmail.com", "amkryukov@gmail.com", "email@email.com", "name@email.com", "info@my-domain.com", "info@website.com", "info@yoursite.com",
+    "046c982186afa15dc9513490293d26b1@o37417.ingest.sentry.io", "team@latofonts.com", "yourname@yourdomain.com", "info@test.com", "Youremail@address.com", "email@example.net",
+    "anapbm@gmail.com", "hi@typemade.mx", "dave@lab6.com", "sample@gmail.com", "some@gmail.com", "myUser@email.com", "you@email.com", "yourmail@yourdomain.com",
+    "contact@sansoxygen.com", "your@email.com", "pr@zumba.com", "privacy@herbalife.com", "youname@email.com", "mymail@mailservice.com", "youremail@email.com", "username@email.com",
+    "filler@godaddy.com", "info@mysite.com", "myemail@mydomain.com", "email@domain.com", "info@yourstore.com", "hello@email.com", "me@email.com", "my@email.com", "me@mail.com",
+    "myemail@mydomain.com", "kamran.a@wellnessliving.com", "mmccormick@contoso.com", "y@gmail.com", "example@domain.com", "you@address.com", "contact@mysite.com", "name@yoursite.com"
+]
+remove_emails_set = set(email.lower() for email in remove_emails)
+
+wb = openpyxl.Workbook()
+ws = wb.active
+
+ws.append(["Website", "Direct Emails", "Internal Page Emails",
+           "Search Engine Emails", "Facebook Emails", "Instagram Emails", "YouTube Emails", "Linktree Emails"])
+
+for website, data in website_email_dict.items():
+    direct_emails_all = set(filter_emails(data["direct"]))
+    selenium_internal_emails_all = set(filter_emails(data["selenium_internal"]))
+    search_engine_emails_all = set(filter_emails(data["search_engine"]))
+    facebook_emails_all = set(filter_emails(data["facebook"]))
+    instagram_emails_all = set(filter_emails(data["instagram"]))
+    youtube_emails_all = set(filter_emails(data["youtube"]))
+    linktree_emails_all = set(filter_emails(data["linktree"]))
+
+    direct_emails = {email for email in direct_emails_all if email.lower() not in remove_emails_set}
+    selenium_internal_emails = {email for email in selenium_internal_emails_all if
+                                email.lower() not in remove_emails_set}
+    search_engine_emails = {email for email in search_engine_emails_all if email.lower() not in remove_emails_set}
+    facebook_emails = {email for email in facebook_emails_all if email.lower() not in remove_emails_set}
+    instagram_emails = {email for email in instagram_emails_all if email.lower() not in remove_emails_set}
+    youtube_emails = {email for email in youtube_emails_all if email.lower() not in remove_emails_set}
+    linktree_emails = {email for email in linktree_emails_all if email.lower() not in remove_emails_set}
+
+    selenium_internal_emails -= direct_emails
+    search_engine_emails -= (direct_emails | selenium_internal_emails)
+    facebook_emails -= (direct_emails | selenium_internal_emails | search_engine_emails)
+
+    row = [
+        website,
+        ', '.join(sorted(direct_emails)),
+        ', '.join(sorted(selenium_internal_emails)),
+        ', '.join(sorted(search_engine_emails)),
+        ', '.join(sorted(facebook_emails)),
+        ', '.join(sorted(instagram_emails)),
+        ', '.join(sorted(youtube_emails)),
+        ', '.join(sorted(linktree_emails))
+    ]
+    ws.append(row)
+
+output_dir = r"C:\Users\KamranAhmed\Downloads"
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+filename = f"USnotfoundweekenddata_{timestamp}.xlsx"
+output_path = os.path.join(output_dir, filename)
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+wb.save(output_path)
+print(f"\nReport generated successfully at: {output_path}")
+
+keywords_to_filter = ["John.Smith", "JohnSmith", "jane.doe", "JSmith", "jdoe", "john", "First.Last", "FirstLast", "j.doe",
+                      "xxxx", "janedoe", "first", "Jane", "webmaster", "flast", "last"]
+
+for row in range(2, ws.max_row + 1):
+    for col in range(2, 9):
+        cell = ws.cell(row=row, column=col)
+        if cell.value:
+            email_list = [email.strip() for email in cell.value.split(',')]
+            filtered_emails = [
+                email for email in email_list
+                if not any(email.lower().startswith(keyword.lower())
+                           for keyword in keywords_to_filter)
+            ]
+            cell.value = ", ".join(filtered_emails)
+
+wb.save(output_path)
+print(f"Fully filtered report (Columns B–H) saved successfully at: {output_path}")
+
+end_time = time.time()
+total_time = end_time - start_time
+minutes, seconds = divmod(total_time, 60)
+
+print("\n========================================================")
+print("                    EXECUTION SUMMARY                   ")
+print("========================================================")
+print(f"Total Websites Provided : {total_urls}")
+print(f"Total Websites Processed: {processed_count}")
+print(f"Total Time Taken        : {int(minutes)} minutes and {seconds:.2f} seconds")
+print("========================================================")
